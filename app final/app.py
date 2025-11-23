@@ -1,5 +1,11 @@
-# app.py
-# Smart Fertilizer Recommender Dashboard + Multi-Soil Crop Selection
+# streamlit_app.py
+# Smart Fertilizer Recommender — Streamlit conversion of your Flask app
+# Requirements (put in requirements.txt):
+# streamlit
+# pyserial  # optional, only if you will use an Arduino sensor
+# pandas
+# (sqlite3 is in stdlib)
+
 import os
 import re
 import threading
@@ -8,15 +14,15 @@ import math
 import sqlite3
 import socket
 from dataclasses import dataclass
-from typing import Dict, Tuple, List
-from flask import Flask, render_template, request, jsonify, redirect, url_for
+from typing import Dict, Tuple, List, Optional
 
+import streamlit as st
+
+# try optional pyserial
 try:
     import serial
-except ImportError:
+except Exception:
     serial = None
-
-# Local network access only
 
 # ---------------- Configuration ----------------
 SERIAL_PORT = os.environ.get("SERIAL_PORT", "COM5")
@@ -50,7 +56,6 @@ CROP_TARGETS: Dict[str, Tuple[float, float, float]] = {
 }
 
 CROP_OPTIONS = list(CROP_TARGETS.keys())
-
 SOIL_CHOICES = [f"Soil {i}" for i in range(1, 11)]
 
 # ---------------- Shared Sensor State ----------------
@@ -66,6 +71,7 @@ class NPKState:
 state = NPKState()
 
 # ---------------- Serial Reader ----------------
+
 def parse_line_for_value(line: str, key: str) -> float:
     if key.lower() not in line.lower():
         return float("nan")
@@ -77,10 +83,14 @@ def parse_line_for_value(line: str, key: str) -> float:
             return float("nan")
     return float("nan")
 
+
 def serial_reader():
+    """Background thread that reads serial lines and updates `state`.
+    If `serial` is None, it will set a helpful message and exit.
+    """
     if serial is None:
         state.ok = False
-        state.msg = "pyserial not installed; cannot read Arduino."
+        state.msg = "pyserial not installed; running without sensor."
         return
     try:
         with serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=READ_TIMEOUT_S) as ser:
@@ -119,13 +129,22 @@ def serial_reader():
         state.ok = False
         state.msg = f"Open error: {e}"
 
+
 # start serial thread (harmless if pyserial not installed)
-t = threading.Thread(target=serial_reader, daemon=True)
-t.start()
+serial_thread_started = False
+
+def start_serial_thread():
+    global serial_thread_started
+    if serial_thread_started:
+        return
+    t = threading.Thread(target=serial_reader, daemon=True)
+    t.start()
+    serial_thread_started = True
 
 # ---------------- Fertilizer Recommendation ----------------
+
 def recommend_fertilizer(crop: str, N: float, P: float, K: float):
-    crop = crop.lower()
+    crop = (crop or "").lower()
     if crop not in CROP_TARGETS:
         return ("No fertilizer", (0,0,0), {"reason": "Unknown crop", "deficits": {}})
 
@@ -164,6 +183,7 @@ def recommend_fertilizer(crop: str, N: float, P: float, K: float):
     })
 
 # ---------------- Crop Suitability Logic ----------------
+
 def suitability_score(soil_N, soil_P, soil_K, crop_N, crop_P, crop_K):
     total_soil = soil_N + soil_P + soil_K
     total_crop = crop_N + crop_P + crop_K
@@ -175,11 +195,11 @@ def suitability_score(soil_N, soil_P, soil_K, crop_N, crop_P, crop_K):
     return round(1 - diff / 2, 3)
 
 # ---------------- SQLite Helpers ----------------
+
 def init_db():
     os.makedirs(DB_DIR, exist_ok=True)
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    # Existing aggregated results table (kept for backward compat if needed)
     c.execute("""
         CREATE TABLE IF NOT EXISTS soil_results (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -191,7 +211,6 @@ def init_db():
             recommended TEXT
         )
     """)
-    # Table for soil samples
     c.execute("""
         CREATE TABLE IF NOT EXISTS soil_samples (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -204,7 +223,6 @@ def init_db():
             locked INTEGER DEFAULT 0
         )
     """)
-    # Table for crops explicitly selected for each soil
     c.execute("""
         CREATE TABLE IF NOT EXISTS soil_selected_crops (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -214,7 +232,6 @@ def init_db():
             FOREIGN KEY(soil_id) REFERENCES soil_samples(id) ON DELETE CASCADE
         )
     """)
-    # New table: per-soil per-crop test results (ranked)
     c.execute("""
         CREATE TABLE IF NOT EXISTS soil_test_results (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -238,15 +255,11 @@ def init_db():
     conn.commit()
     conn.close()
 
+
 def save_raw_soil_sample(soil_name: str, N: float, P: float, K: float, crop_name: str = None, force: bool = False):
-    """
-    Save or update a soil sample. If the soil sample is locked (finalized after testing),
-    do not overwrite unless `force=True` (explicit operation such as running tests or user save).
-    """
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
 
-    # Check if existing sample is locked
     c.execute("SELECT locked FROM soil_samples WHERE name = ?", (soil_name,))
     existing = c.fetchone()
     if existing is not None:
@@ -259,7 +272,6 @@ def save_raw_soil_sample(soil_name: str, N: float, P: float, K: float, crop_name
             return
 
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
-    # If exists update, else insert
     if existing is not None:
         c.execute("""
             UPDATE soil_samples
@@ -280,11 +292,8 @@ def save_raw_soil_sample(soil_name: str, N: float, P: float, K: float, crop_name
     if crop_name and soil_id is not None:
         record_selected_crop(soil_id, crop_name)
 
+
 def save_test_results_for_soil(soil_id: int, results: List[dict]):
-    """
-    results: list of dicts with keys: crop (string), score (float), fertilizer (string), rank (int)
-    This function deletes any previous test results for the soil and inserts the new ones.
-    """
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute("DELETE FROM soil_test_results WHERE soil_id = ?", (soil_id,))
@@ -296,8 +305,8 @@ def save_test_results_for_soil(soil_id: int, results: List[dict]):
         """, (soil_id, r["crop"], r["score"], r["fertilizer"], r["rank"], ts))
     conn.commit()
     conn.close()
-    # After saving test results, mark the soil as locked (finalized)
     set_soil_locked(soil_id, True)
+
 
 def set_soil_locked(soil_id: int, locked: bool):
     conn = sqlite3.connect(DB_FILE)
@@ -306,6 +315,7 @@ def set_soil_locked(soil_id: int, locked: bool):
     conn.commit()
     conn.close()
 
+
 def clear_test_results_for_soil(soil_id: int):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
@@ -313,9 +323,11 @@ def clear_test_results_for_soil(soil_id: int):
     conn.commit()
     conn.close()
 
+
 def get_soil_id_by_name(name: str):
     row = get_soil_by_name(name)
     return row["id"] if row else None
+
 
 def record_selected_crop(soil_id: int, crop_name: str):
     if soil_id is None or not crop_name:
@@ -331,17 +343,15 @@ def record_selected_crop(soil_id: int, crop_name: str):
     conn.commit()
     conn.close()
 
+
 def get_selected_crops_for_soil(soil_id: int) -> List[str]:
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute("""
-        SELECT crop_name FROM soil_selected_crops
-        WHERE soil_id = ?
-        ORDER BY id ASC
-    """, (soil_id,))
+    c.execute("SELECT crop_name FROM soil_selected_crops WHERE soil_id = ? ORDER BY id ASC", (soil_id,))
     rows = [r[0] for r in c.fetchall()]
     conn.close()
     return rows
+
 
 def get_soil_by_name(name: str):
     conn = sqlite3.connect(DB_FILE)
@@ -352,8 +362,8 @@ def get_soil_by_name(name: str):
     conn.close()
     return row
 
+
 def row_get(row, key, default=None):
-    """Safe helper to read a key from sqlite3.Row or dict-like objects."""
     if isinstance(row, sqlite3.Row):
         return row[key] if key in row.keys() else default
     try:
@@ -363,6 +373,7 @@ def row_get(row, key, default=None):
             return row[key]
         except Exception:
             return default
+
 
 def get_test_results_for_soil_id(soil_id: int):
     conn = sqlite3.connect(DB_FILE)
@@ -378,303 +389,208 @@ def get_test_results_for_soil_id(soil_id: int):
     conn.close()
     return rows
 
-# ---------------- Flask App ----------------
-app = Flask(__name__)
+# ---------------- Streamlit UI ----------------
 
-def get_local_ip():
-    """Get the local IP address for network access"""
-    try:
-        # Connect to a remote address to determine local IP
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
-    except Exception:
-        return "localhost"
+st.set_page_config(page_title="Smart Fertilizer Recommender", layout="wide")
 
-@app.route("/")
-def home():
-    return redirect(url_for("dashboard"))
+# initialize DB and start serial thread once
+init_db()
+start_serial_thread()
 
-@app.route("/dashboard")
-def dashboard():
-    local_ip = get_local_ip()
-    return render_template("dashboard.html", sensor_ok=state.ok, sensor_msg=state.msg, local_ip=local_ip)
+# Sidebar navigation
+page = st.sidebar.selectbox("Page", ["Dashboard", "Select Crop", "Run Tests", "Show Crop", "Manage Samples"])
 
-# Select crop page: shows live sensor readings and allows saving raw soil samples
-@app.route("/select_crop")
-def select_crop():
-    crop = request.args.get("crop", "tomato")
-    soil_name = request.args.get("soil")
-    N, P, K = state.N, state.P, state.K
-    fert_name, fert_npk, meta = recommend_fertilizer(crop, N, P, K)
-    meta.setdefault("targets_scaled", {"N": 0, "P": 0, "K": 0})
-    meta.setdefault("deficits", {"N": 0, "P": 0, "K": 0})
+# Utility: format timestamp
 
-    soil_names = SOIL_CHOICES
-    if not soil_name:
-        soil_name = soil_names[0]
+def format_ts(ts: float) -> str:
+    if not ts:
+        return ""
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
 
-    return render_template(
-        "select_crop.html",
-        crop_options=CROP_OPTIONS,
-        selected_crop=crop,
-        soil_options=soil_names,
-        selected_soil=soil_name,
-        sensor_ok=state.ok,
-        sensor_msg=state.msg,
-        N=None if state.N != state.N else round(state.N, 2),
-        P=None if state.P != state.P else round(state.P, 2),
-        K=None if state.K != state.K else round(state.K, 2),
-        recommended=fert_name,
-        rec_n=fert_npk[0],
-        rec_p=fert_npk[1],
-        rec_k=fert_npk[2],
-        meta=meta
-    )
+# Dashboard page
+if page == "Dashboard":
+    st.title("Smart Fertilizer Recommender — Dashboard")
+    st.subheader("Sensor Status")
+    cols = st.columns([2,3])
+    with cols[0]:
+        st.metric("Sensor OK", "Yes" if state.ok else "No", delta=None)
+        st.write(state.msg)
+        st.write("Last update:", format_ts(state.ts))
+        if st.button("Refresh"):
+            st.experimental_rerun()
+    with cols[1]:
+        st.write("### Latest NPK Readings")
+        st.write("Nitrogen (N):", None if state.N != state.N else round(state.N,2))
+        st.write("Phosphorus (P):", None if state.P != state.P else round(state.P,2))
+        st.write("Potassium (K):", None if state.K != state.K else round(state.K,2))
 
-# Legacy endpoint (kept for compatibility)
-@app.route("/test_soil", methods=["POST"])
-def test_soil():
-    soil_name = request.form.get("soil_name", "").strip()
-    crop_name = request.form.get("crop_name", "").strip() or None
-    if not soil_name:
-        return jsonify({"error": "Missing soil name"}), 400
-    N, P, K = state.N, state.P, state.K
-    if any(math.isnan(x) for x in (N, P, K)):
-        return jsonify({"error": "Invalid or missing NPK readings"}), 400
+    st.markdown("---")
+    st.write("You can configure serial port via environment variable `SERIAL_PORT` and `BAUD_RATE`.")
+    st.write("If running without a physical sensor, pyserial is optional and the app will function using manual inputs on the Select Crop page.")
 
-    save_raw_soil_sample(soil_name, N, P, K, crop_name)
-    return jsonify({"success": True, "soil": soil_name, "crop": crop_name, "N": round(N, 2), "P": round(P, 2), "K": round(K, 2)})
+# Select Crop page
+elif page == "Select Crop":
+    st.title("Select Crop & Save Soil Sample")
+    st.write("Use live sensor readings (if connected) or enter N/P/K manually.")
 
-# API endpoint for saving soil from select_crop page
-@app.route("/api/save_soil", methods=["POST"])
-def api_save_soil():
-    """Save current live sensor readings for a specific soil and crop"""
-    data = request.get_json() or {}
-    soil_name = (data.get("soil_name") or "").strip()
-    crop_name = (data.get("crop_name") or "").strip()
-    
-    if not soil_name:
-        return jsonify({"error": "Missing soil selection", "msg": "Please select a soil first."}), 400
-    if not crop_name:
-        return jsonify({"error": "Missing crop selection", "msg": "Please select a crop to test."}), 400
-    
-    N, P, K = state.N, state.P, state.K
-    if any(math.isnan(x) for x in (N, P, K)):
-        return jsonify({"error": "Invalid or missing NPK readings", "msg": "No valid sensor readings available."}), 400
-    
-    # Use force=True to allow saving even if soil is locked (user explicitly saving new data)
-    save_raw_soil_sample(soil_name, N, P, K, crop_name, force=True)
-    return jsonify({
-        "success": True,
-        "msg": f"✓ Saved {soil_name} for crop '{crop_name.title()}'! N: {round(N, 2)}, P: {round(P, 2)}, K: {round(K, 2)} mg/kg",
-        "soil": soil_name,
-        "crop": crop_name,
-        "N": round(N, 2),
-        "P": round(P, 2),
-        "K": round(K, 2)
-    })
+    col1, col2 = st.columns([1,2])
+    with col1:
+        soil = st.selectbox("Select Soil", SOIL_CHOICES)
+        crop = st.selectbox("Select Crop", [c.title() for c in CROP_OPTIONS])
+        st.checkbox("Lock sample after saving (finalize)", key="lock_sample")
 
-# Run tests for a single soil (by name) OR all soils (if no 'soil' param)
-# This computes top 10 crops per soil and saves them into soil_test_results
-@app.route("/run_tests", methods=["POST"])
-def run_tests():
-    """Run suitability tests for selected soil using current live sensor reading."""
-    soil_name = request.form.get("soil")
-    if not soil_name:
-        return jsonify({"error": "Missing soil parameter"}), 400
-    
-    # Use live sensor data
-    N, P, K = state.N, state.P, state.K
-    if any(math.isnan(x) for x in (N, P, K)):
-        return jsonify({"error": "Invalid or missing NPK readings from sensor"}), 400
+    with col2:
+        st.write("### Sensor / Manual Inputs")
+        use_sensor = st.checkbox("Use live sensor readings if available", value=True)
+        if use_sensor and state.ok:
+            N_val = None if state.N != state.N else round(state.N,2)
+            P_val = None if state.P != state.P else round(state.P,2)
+            K_val = None if state.K != state.K else round(state.K,2)
+            st.write(f"Sensor readings (last: {format_ts(state.ts)})")
+            st.write("N:", N_val, "P:", P_val, "K:", K_val)
+        else:
+            st.write("Enter NPK values manually (mg/kg)")
+            N_val = st.number_input("Nitrogen (N)", min_value=0.0, value=0.0, format="%.2f")
+            P_val = st.number_input("Phosphorus (P)", min_value=0.0, value=0.0, format="%.2f")
+            K_val = st.number_input("Potassium (K)", min_value=0.0, value=0.0, format="%.2f")
 
-    # Get or create soil entry
-    soil_row = get_soil_by_name(soil_name)
-    if not soil_row:
-        # Create new soil entry with live data
-        save_raw_soil_sample(soil_name, N, P, K, None, force=True)
-        soil_row = get_soil_by_name(soil_name)
-    
-    soil_id = soil_row["id"]
-    
-    # Unlock the soil and clear old test results when starting a new test
-    # This allows new data to be saved and ensures fresh test results
-    clear_test_results_for_soil(soil_id)
-    set_soil_locked(soil_id, False)
-    
-    # Update soil with latest live sensor readings (force update while running tests)
-    save_raw_soil_sample(soil_name, N, P, K, row_get(soil_row, "last_crop"), force=True)
+    if st.button("Compute Recommendation"):
+        if use_sensor and state.ok:
+            N = state.N; P = state.P; K = state.K
+        else:
+            N = N_val; P = P_val; K = K_val
+        fert_name, fert_npk, meta = recommend_fertilizer(crop, N, P, K)
+        st.success(f"Recommended: {fert_name}")
+        st.write("Fertilizer NPK:", fert_npk)
+        st.json(meta)
 
-    selected_crops = get_selected_crops_for_soil(soil_id)
-    if not selected_crops:
-        return jsonify({"error": f"No crops have been saved for {soil_name} yet. Save crops first in Select Crop page."}), 400
+    st.markdown("---")
+    with st.form("save_sample"):
+        st.write("### Save current sample to database")
+        soil_name_input = st.text_input("Soil name", value=soil)
+        crop_for_save = st.selectbox("Crop for this sample", [c.title() for c in CROP_OPTIONS], index=CROP_OPTIONS.index(crop.lower()) if crop.lower() in CROP_OPTIONS else 0)
+        force_save = st.checkbox("Force save (overwrite locked)")
+        submitted = st.form_submit_button("Save Sample")
+        if submitted:
+            if use_sensor and state.ok:
+                N_save = state.N; P_save = state.P; K_save = state.K
+            else:
+                N_save = N_val; P_save = P_val; K_save = K_val
+            if any(math.isnan(x) for x in (N_save, P_save, K_save)):
+                st.error("Invalid or missing NPK values. Cannot save.")
+            else:
+                save_raw_soil_sample(soil_name_input, float(N_save), float(P_save), float(K_save), crop_for_save, force=force_save)
+                st.success(f"Saved {soil_name_input} (Crop: {crop_for_save})")
 
-    crop_scores = []
-    for crop in selected_crops:
-        crop_key = crop.lower()
-        if crop_key not in CROP_TARGETS:
-            continue
-        cN, cP, cK = CROP_TARGETS[crop_key]
-        score = suitability_score(N, P, K, cN, cP, cK)
-        fert_name, _, _ = recommend_fertilizer(crop_key, N, P, K)
-        crop_scores.append({
-            "crop": crop.title(),
-            "score": score,
-            "fertilizer": fert_name
-        })
+# Run Tests page
+elif page == "Run Tests":
+    st.title("Run Suitability Tests for a Soil")
+    soil_sel = st.selectbox("Choose soil to test", SOIL_CHOICES)
+    if st.button("Start Test"):
+        soil_row = get_soil_by_name(soil_sel)
+        if not soil_row:
+            st.error("No saved sample for this soil. Save it first on Select Crop page.")
+        else:
+            N, P, K = float(soil_row["N"]), float(soil_row["P"]), float(soil_row["K"]) if soil_row["N"] is not None else (None, None, None)
+            # Use stored values for test
+            if any(v is None for v in (N,P,K)):
+                st.error("Saved sample has missing NPK values.")
+            else:
+                selected_crops = get_selected_crops_for_soil(soil_row["id"]) or [c.title() for c in CROP_OPTIONS]
+                crop_scores = []
+                for crop in selected_crops:
+                    crop_key = crop.lower()
+                    if crop_key not in CROP_TARGETS:
+                        continue
+                    cN, cP, cK = CROP_TARGETS[crop_key]
+                    score = suitability_score(N, P, K, cN, cP, cK)
+                    fert_name, _, _ = recommend_fertilizer(crop_key, N, P, K)
+                    crop_scores.append({"crop": crop.title(), "score": score, "fertilizer": fert_name})
 
-    if not crop_scores:
-        return jsonify({"error": "Saved crops are not recognized in the current crop list."}), 400
+                if not crop_scores:
+                    st.warning("No crops to evaluate.")
+                else:
+                    top_crops = sorted(crop_scores, key=lambda x: x["score"], reverse=True)
+                    results = []
+                    for idx, r in enumerate(top_crops, start=1):
+                        results.append({"crop": r["crop"], "score": r["score"], "fertilizer": r["fertilizer"], "rank": idx})
+                    save_test_results_for_soil(soil_row["id"], results)
+                    st.success(f"Test completed and saved for {soil_sel}")
 
-    top_crops = sorted(crop_scores, key=lambda x: x["score"], reverse=True)
-
-    results = []
-    for idx, r in enumerate(top_crops, start=1):
-        results.append({
-            "crop": r["crop"],
-            "score": r["score"],
-            "fertilizer": r["fertilizer"],
-            "rank": idx
-        })
-
-    save_test_results_for_soil(soil_id, results)
-
-    return jsonify({"success": True, "processed": [{"soil": soil_name, "tested_count": len(results)}]})
-
-# Show crop recommendations filtered by selected soil
-@app.route("/show_crop", methods=["GET"])
-def show_crop():
-    selected_soil = request.args.get("soil")
-    
-    soil_options = SOIL_CHOICES
+# Show Crop page
+elif page == "Show Crop":
+    st.title("Show Crop Recommendations")
+    selected_soil = st.selectbox("Which soil?", [None] + SOIL_CHOICES)
     if not selected_soil:
-        return render_template("show_crop.html", soils=soil_options, selected_soil=None)
-    if selected_soil not in soil_options:
-        return render_template("show_crop.html", error="Soil not recognized. Please choose from Soil 1-10.", soils=soil_options, selected_soil=None)
+        st.info("Select a soil to view recommendations and stored results.")
+    else:
+        soil_row = get_soil_by_name(selected_soil)
+        if not soil_row:
+            st.warning("No saved sample for this soil.")
+        else:
+            N = soil_row["N"]; P = soil_row["P"]; K = soil_row["K"]
+            st.write("Saved sample (N,P,K):", N, P, K)
+            rows = get_test_results_for_soil_id(soil_row["id"]) or []
+            if not rows:
+                st.info("No test results saved for this soil. Run tests first.")
+            else:
+                st.write("Test timestamp: ", row_get(rows[0], "timestamp", ""))
+                table = []
+                for r in rows:
+                    table.append({
+                        "Rank": r["rank"],
+                        "Crop": r["crop_name"].title(),
+                        "Score": float(r["suitability_score"]),
+                        "Fertilizer": r["fertilizer_recommendation"],
+                        "Timestamp": row_get(r, "timestamp", "")
+                    })
+                st.table(table)
 
-    soil_row = get_soil_by_name(selected_soil)
-    soil_id = soil_row["id"] if soil_row else None
-    N = soil_row["N"] if soil_row else None
-    P = soil_row["P"] if soil_row else None
-    K = soil_row["K"] if soil_row else None
+# Manage Samples page
+elif page == "Manage Samples":
+    st.title("Manage Samples")
+    st.write("View, unlock, or delete stored soil samples and selected crops.")
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT id, name, N, P, K, timestamp, locked, last_crop FROM soil_samples ORDER BY id ASC")
+    samples = c.fetchall()
+    conn.close()
 
-    rows = get_test_results_for_soil_id(soil_id) if soil_id else []
-    top_crops = [{
-        "crop": r["crop_name"],
-        "score": r["suitability_score"],
-        "fertilizer": r["fertilizer_recommendation"],
-        "rank": r["rank"],
-        "timestamp": row_get(r, "timestamp", "")
-    } for r in rows] if rows else []
-    test_timestamp = row_get(rows[0], "timestamp", "") if rows else ""
+    if not samples:
+        st.info("No saved samples yet.")
+    else:
+        for s in samples:
+            cols = st.columns([3,1,1,1,1])
+            with cols[0]:
+                st.write(f"**{s['name']}** — saved: {row_get(s,'timestamp','')} — Crop: {row_get(s,'last_crop','')}")
+                st.write(f"N:{s['N']} P:{s['P']} K:{s['K']}")
+            with cols[1]:
+                if st.button(f"Unlock### {s['id']}"):
+                    set_soil_locked(s['id'], False)
+                    st.experimental_rerun()
+            with cols[2]:
+                if st.button(f"Clear results### {s['id']}"):
+                    clear_test_results_for_soil(s['id'])
+                    st.experimental_rerun()
+            with cols[3]:
+                if st.button(f"Delete sample### {s['id']}"):
+                    conn = sqlite3.connect(DB_FILE)
+                    c = conn.cursor()
+                    c.execute("DELETE FROM soil_test_results WHERE soil_id = ?", (s['id'],))
+                    c.execute("DELETE FROM soil_selected_crops WHERE soil_id = ?", (s['id'],))
+                    c.execute("DELETE FROM soil_samples WHERE id = ?", (s['id'],))
+                    conn.commit()
+                    conn.close()
+                    st.experimental_rerun()
+            with cols[4]:
+                st.write("Locked" if s['locked'] else "Unlocked")
 
-    return render_template(
-        "show_crop.html",
-        soils=soil_options,
-        selected_soil=selected_soil,
-        top_crops=top_crops,
-        N=N,
-        P=P,
-        K=K,
-        has_test_results=len(top_crops) > 0,
-        test_timestamp=test_timestamp,
-        last_crop=row_get(soil_row, "last_crop") if soil_row else ""
-    )
-
-@app.route("/api/top_crops")
-def api_top_crops():
-    """Return sensor readings and stored rankings for selected soil."""
-    soil_name = request.args.get("soil")
-    if not soil_name:
-        return jsonify({"error": "Missing soil parameter"}), 400
-    
-    soil_row = get_soil_by_name(soil_name)
-    soil_id = soil_row["id"] if soil_row else None
-    N = float(soil_row["N"]) if soil_row else None
-    P = float(soil_row["P"]) if soil_row else None
-    K = float(soil_row["K"]) if soil_row else None
-    timestamp = row_get(soil_row, "timestamp", "") if soil_row else ""
-    rows = get_test_results_for_soil_id(soil_id) if soil_id else []
-
-    top_crops = []
-    test_timestamp = ""
-    for r in rows:
-        fert_name = r["fertilizer_recommendation"]
-        fert_npk = FERTILIZERS.get(fert_name, (0, 0, 0))
-        crop_timestamp = row_get(r, "timestamp", "")
-        if crop_timestamp and not test_timestamp:
-            test_timestamp = crop_timestamp
-        top_crops.append({
-            "crop": r["crop_name"],
-            "score": float(r["suitability_score"]),
-            "fertilizer": fert_name,
-            "rank": int(r["rank"]),
-            "n": fert_npk[0],
-            "p": fert_npk[1],
-            "k": fert_npk[2],
-            "timestamp": crop_timestamp
-        })
-    # include locked status so UI can show finalised state
-    locked_status = bool(row_get(soil_row, "locked", 0)) if soil_row else False
-
-    return jsonify({
-        "N": None if N is None else round(N, 2),
-        "P": None if P is None else round(P, 2),
-        "K": None if K is None else round(K, 2),
-        "timestamp": timestamp,
-        "test_timestamp": test_timestamp,
-        "top_crops": top_crops,
-        "has_test_results": len(top_crops) > 0,
-        "last_crop": row_get(soil_row, "last_crop") if soil_row else "",
-        "locked": locked_status
-    })
+# Footer: tips
+st.sidebar.markdown("---")
+st.sidebar.write("Tips:")
+st.sidebar.write("• To use a physical Arduino sensor, install pyserial and set SERIAL_PORT and BAUD_RATE environment variables.")
+st.sidebar.write("• To deploy: put this file in a GitHub repo with requirements.txt and deploy to Streamlit Cloud (share.streamlit.io)")
 
 
-@app.route("/api/start_new_test", methods=["POST"])
-def api_start_new_test():
-    """Unlock the soil sample for a new test and clear previous rankings.
-    This must be called explicitly to allow the sample to be overwritten again.
-    """
-    soil_name = request.form.get("soil") or request.json and request.json.get("soil")
-    if not soil_name:
-        return jsonify({"error": "Missing soil parameter"}), 400
-    soil_row = get_soil_by_name(soil_name)
-    if not soil_row:
-        return jsonify({"error": "Soil not found"}), 404
-    soil_id = soil_row["id"]
-    # clear previous stored test results and unlock
-    clear_test_results_for_soil(soil_id)
-    set_soil_locked(soil_id, False)
-    return jsonify({"success": True, "msg": f"Unlocked {soil_name} for new testing."})
-
-@app.route("/api/readings")
-def api_readings():
-    return jsonify({
-        "ok": state.ok,
-        "msg": state.msg,
-        "N": None if state.N != state.N else state.N,
-        "P": None if state.P != state.P else state.P,
-        "K": None if state.K != state.K else state.K,
-        "ts": state.ts
-    })
-
-
-if __name__ == "__main__":
-    init_db()
-    time.sleep(1.0)
-    
-    local_ip = get_local_ip()
-    
-    print(f"\n{'='*60}")
-    print(" Smart Fertilizer Recommender - Starting Server")
-    print(f"{'='*60}")
-    print(f"\n LOCAL NETWORK ACCESS:")
-    print(f"   http://localhost:5000 (this computer)")
-    print(f"   http://{local_ip}:5000 (same Wi-Fi network)")
-    print(f"\n{'='*60}\n")
-    
-    # Enable threading to support multiple concurrent connections (multiple phones)
-    app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
+# End of file
